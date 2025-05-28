@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
 def load_config(config_path):
     """Loads configuration from a YAML file."""
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             config_data = yaml.safe_load(f)
         print(f"Successfully loaded configuration from '{config_path}'")
         # Provide defaults for keys that might be missing to avoid KeyErrors later
