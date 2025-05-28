@@ -1,0 +1,21 @@
+# Core Gradio and Web Interface
+gradio
+
+# Data Handling and Manipulation
+pandas
+
+# Plotting
+matplotlib
+
+# YAML Configuration File Handling
+PyYAML
+
+# Bioinformatics (for future NCBI/Sequence analysis)
+biopython
+
+# For 3D molecule visualization (if you choose to embed it directly)
+# py3Dmol
+# nglview # Typically used in Jupyter, might be harder to integrate directly in Gradio standalone
+
+# For making HTTP requests (e.g., to AlphaFold DB API or other REST APIs)
+# requests
