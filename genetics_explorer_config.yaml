@@ -1,59 +1,40 @@
-# Configuration for the Plant Genetics Explorer
+# Configuration for the Plant Genetics Explorer (Live Data Focus v3.0)
 
 # --- General App Settings ---
-app_title: "🌱 Plant Genetics Explorer (Configured v2.1)"
+app_title: "🌱 Plant Genetics Explorer (Live NCBI Data)"
 app_description: |
-  Explore open genetic databases and analyze (mock) gene-trait relationships in plants.
-  **Note:** This is a simplified demonstrator using configuration from YAML.
-  Sample files generated are saved to the configured data directory.
+  Explore live gene data fetched directly from NCBI.
+  **Note:** Ensure your Entrez email is correctly set for NCBI access.
+  Fetched files are saved to the configured data directory.
+
+# --- NCBI Entrez Email ---
+# IMPORTANT: Replace with your actual email address for reliable NCBI access.
+entrez_email: "Williambfreeforlife@gmail.com" 
 
 # --- Data Directory ---
-data_directory: "genetic_data_output" # You can change this path
+data_directory: "genetic_data_output_live" # You can change this path
 
 # --- Database Acquisition Guide Settings ---
+# This section provides informational links to various databases.
 database_options:
   - "NCBI (SRA, GenBank, RefSeq)"
   - "Ensembl Plants"
   - "Phytozome (JGI)"
-  - "The Arabidopsis Information Resource (TAIR)" # Example of adding another
-default_database: "Ensembl Plants"
+  - "The Arabidopsis Information Resource (TAIR)"
+default_database: "NCBI (SRA, GenBank, RefSeq)"
 
-# --- Mock Gene Data (can be extensive) ---
-# You can move the entire MOCK_GENE_DATA dictionary here.
-# For brevity in this example, I'll show a shortened version.
-# Ensure the structure matches the Python dictionary.
-mock_gene_data:
-  AT1G01010:
-    name: "Photosystem II subunit P (YAML)"
-    description: "Essential for the assembly and stability of photosystem II."
-    traits: ["Photosynthesis Efficiency", "Growth Rate"]
-    expression_levels: {leaf: 105, root: 25, flower: 65} # Slightly different values
-    go_terms: ["GO:0009521", "GO:0015979"]
-    ncbi_gene_id: "839502"
-    ensembl_plants_id: "AT1G01010"
-  AT1G01020:
-    name: "F-box family protein (YAML)"
-    description: "Involved in protein degradation pathways, affecting development."
-    traits: ["Flowering Time", "Stress Response"]
-    expression_levels: {leaf: 55, root: 75, flower: 95}
-    go_terms: ["GO:0003674", "GO:0008150"]
-    ncbi_gene_id: "839503"
-    ensembl_plants_id: "AT1G01020"
-  AT1G01030:
-    name: "Heat shock protein 70 (YAML)"
-    description: "Chaperone protein involved in response to heat and other stresses."
-    traits: ["Stress Response", "Protein Folding"]
-    expression_levels: {leaf: 35, root: 85, flower: 45}
-    go_terms: ["GO:0006950", "GO:0003774"]
-    ncbi_gene_id: "839504"
-    ensembl_plants_id: "AT1G01030"
-  AT2G01010:
-    name: "Auxin response factor (YAML)"
-    description: "Transcription factor mediating auxin signaling."
-    traits: ["Root Development", "Growth Rate"]
-    expression_levels: {leaf: 45, root: 125, flower: 55}
-    go_terms: ["GO:0009733", "GO:0003677"]
-    ncbi_gene_id: "824100"
-    ensembl_plants_id: "AT2G01010"
+# --- NCBI Search Settings ---
+# Species options for contextual keyword search on NCBI tab.
+ncbi_plant_species_options:
+  - "Arabidopsis thaliana"
+  - "Oryza sativa Japonica Group" # Rice
+  - "Zea mays" # Maize / Corn
+  - "Glycine max" # Soybean
+  - "Solanum lycopersicum" # Tomato
+  - "Triticum aestivum" # Wheat
+  - "Vitis vinifera" # Grape
+  - "Populus trichocarpa" # Poplar
+  - "Medicago truncatula"
+  # Add more common plant species as needed
 
-# You could add more configuration options here if needed, e.g., plot colors, etc.
+# --- NCBI Search Defaults ---

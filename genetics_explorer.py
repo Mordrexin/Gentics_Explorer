@@ -1,44 +1,38 @@
+
+
 import gradio as gr
-import pandas as pd
-import matplotlib.pyplot as plt
+import pandas as pd 
+import matplotlib.pyplot as plt 
 import os
 import io
-import time # For timestamped filenames
-import yaml # For loading YAML configuration
-# import shutil # Could be used for more aggressive cleanup if needed
+import time 
+import yaml 
+import urllib.parse 
+
+from Bio import Entrez, SeqIO
+from xml.etree import ElementTree 
 
 # --- 0. Configuration Loading ---
 CONFIG_FILE = "genetics_explorer_config.yaml"
 DEFAULT_CONFIG = {
-    "app_title": "🌱 Plant Genetics Explorer (Default Config)",
-    "app_description": "Default description. Create `genetics_explorer_config.yaml`.",
-    "data_directory": "data_default",
-    "database_options": ["NCBI (SRA, GenBank, RefSeq)", "Ensembl Plants"],
-    "default_database": "NCBI (SRA, GenBank, RefSeq)",
-    "mock_gene_data": { # Minimal fallback mock data
-        "AT_DEFAULT": {
-            "name": "Default Gene", "description": "Default description.",
-            "traits": ["Default Trait"], "expression_levels": {"tissue1": 50},
-            "go_terms": ["GO:0000000"], "ncbi_gene_id": "000000", "ensembl_plants_id": "AT_DEFAULT"
-        }
-    }
+    "app_title": "🌱 Plant Genetics Explorer (Live NCBI Data - Default)",
+    "app_description": "Explore live gene data from NCBI. Configure `genetics_explorer_config.yaml`.",
+    "data_directory": "genetic_data_live_default",
+    "entrez_email": "your.email@example.com", 
+    "ncbi_plant_species_options": ["Arabidopsis thaliana", "Oryza sativa Japonica Group"],
 }
 
 def load_config(config_path):
-    """Loads configuration from a YAML file."""
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config_data = yaml.safe_load(f)
         print(f"Successfully loaded configuration from '{config_path}'")
-        # Provide defaults for keys that might be missing to avoid KeyErrors later
-        # This makes the config file more flexible if a user omits non-critical parts
         return {
             "app_title": config_data.get("app_title", DEFAULT_CONFIG["app_title"]),
             "app_description": config_data.get("app_description", DEFAULT_CONFIG["app_description"]),
             "data_directory": config_data.get("data_directory", DEFAULT_CONFIG["data_directory"]),
-            "database_options": config_data.get("database_options", DEFAULT_CONFIG["database_options"]),
-            "default_database": config_data.get("default_database", DEFAULT_CONFIG["default_database"]),
-            "mock_gene_data": config_data.get("mock_gene_data", DEFAULT_CONFIG["mock_gene_data"])
+            "entrez_email": config_data.get("entrez_email", DEFAULT_CONFIG["entrez_email"]),
+            "ncbi_plant_species_options": config_data.get("ncbi_plant_species_options", DEFAULT_CONFIG["ncbi_plant_species_options"]),
         }
     except FileNotFoundError:
         print(f"Warning: Configuration file '{config_path}' not found. Using default configuration.")
@@ -50,262 +44,488 @@ def load_config(config_path):
         print(f"An unexpected error occurred while loading config: {e}. Using default configuration.")
         return DEFAULT_CONFIG
 
-# Load configuration
 config = load_config(CONFIG_FILE)
 
 DATA_DIR = config["data_directory"]
-MOCK_GENE_DATA = config["mock_gene_data"]
+ENTREZ_EMAIL = config["entrez_email"]
+NCBI_PLANT_SPECIES = config["ncbi_plant_species_options"]
 
-# Create a reverse mapping for traits to genes (dynamically from loaded MOCK_GENE_DATA)
-MOCK_TRAIT_TO_GENES = {}
-if MOCK_GENE_DATA: # Check if mock_gene_data is not empty
-    for gene_id, data in MOCK_GENE_DATA.items():
-        if "traits" in data and data["traits"]: # Check if 'traits' key exists and is not empty
-            for trait in data["traits"]:
-                if trait not in MOCK_TRAIT_TO_GENES:
-                    MOCK_TRAIT_TO_GENES[trait] = []
-                MOCK_TRAIT_TO_GENES[trait].append(gene_id)
-else:
-    print("Warning: MOCK_GENE_DATA is empty or not loaded correctly. Trait explorer might not function as expected.")
+if ENTREZ_EMAIL == "your.email@example.com" or not ENTREZ_EMAIL:
+    print("CRITICAL WARNING: NCBI Entrez email is not set or is default. Update in YAML for reliable NCBI access.")
+Entrez.email = ENTREZ_EMAIL
 
+app_state = {
+    "last_fetched_ncbi_gene_details": None
+}
 
 def setup_data_directory():
-    """Creates the data directory if it doesn't exist."""
     os.makedirs(DATA_DIR, exist_ok=True)
     print(f"Data directory '{DATA_DIR}' ensured at {os.path.abspath(DATA_DIR)}")
 
 def list_data_files_md():
-    """Returns a markdown string listing files in the DATA_DIR."""
     if not os.path.exists(DATA_DIR) or not os.listdir(DATA_DIR):
         return f"No files in data directory (`{DATA_DIR}`) yet."
-    
-    files = sorted(os.listdir(DATA_DIR)) # Sort for consistent order
+    files = sorted(os.listdir(DATA_DIR)) 
     md_list = f"### Files in `./{DATA_DIR}` directory:\n"
     for f_name in files:
         md_list += f"- `{f_name}`\n"
     return md_list
 
-# --- 1. Data Acquisition Guide Functions ---
-
-def get_database_info(db_name, species, search_term):
-    info = f"### Information for {db_name}\n"
-    info += f"**Species:** {species if species else 'Not specified'}\n"
-    info += f"**Search Term:** {search_term if search_term else 'Not specified'}\n\n"
-
-    # Database specific information
-    # Note: The actual logic here doesn't change much, but the available db_name options
-    # can now be controlled by the YAML.
-    if db_name == "NCBI (SRA, GenBank, RefSeq)":
-        info += "**Access Points:**\n"
-        info += "- **NCBI Search:** [https://www.ncbi.nlm.nih.gov/](https://www.ncbi.nlm.nih.gov/)\n"
-        info += "- **SRA (Sequence Read Archive):** For raw sequencing data. Search by project, sample, or run accession.\n"
-        info += "  - *Example Tool:* `sra-tools` (e.g., `prefetch SRRXXXXXX && fastq-dump SRRXXXXXX`)\n"
-        info += "- **GenBank/RefSeq:** For assembled genomes, genes, proteins. Search by gene name, accession, or organism.\n"
-        info += "  - *Example Tool:* `ncbi-datasets-cli` (e.g., `ncbi-datasets-cli download genome accession GCF_000001735.4` for Arabidopsis)\n"
-        if species:
-            info += f"  - *NCBI Taxonomy ID for {species} (example):* You'd look this up (e.g., Arabidopsis thaliana is 3702)\n"
-        if search_term:
-             info += f"  - *Direct NCBI Gene Search for '{search_term}':* [https://www.ncbi.nlm.nih.gov/gene/?term={search_term.replace(' ', '+')}%5Bgene%5D+AND+{species.replace(' ', '+')}%5Borgn%5D](https://www.ncbi.nlm.nih.gov/gene/?term={search_term.replace(' ', '+')}%5Bgene%5D+AND+{species.replace(' ', '+')}%5Borgn%5D)\n"
-
-    elif db_name == "Ensembl Plants":
-        info += "**Access Points:**\n"
-        info += "- **Website:** [https://plants.ensembl.org/](https://plants.ensembl.org/)\n"
-        info += "- **BioMart:** Data mining tool for custom dataset downloads.\n"
-        info += "- **FTP Server:** For bulk downloads of genomes, annotations (GFF3), sequences (FASTA).\n"
-        if species:
-            species_formatted = species.lower().replace(" ", "_")
-            info += f"  - *Example Species Page:* [https://plants.ensembl.org/{species_formatted}/Info/Index](https://plants.ensembl.org/{species_formatted}/Info/Index)\n"
-        if search_term:
-            info += f"  - *Example Search for '{search_term}' in {species if species else 'all species'}:* [https://plants.ensembl.org/Multi/Search/Results?species={species_formatted if species else 'all'};idx=;q={search_term}](https://plants.ensembl.org/Multi/Search/Results?species={species_formatted if species else 'all'};idx=;q={search_term})\n"
-
-    elif db_name == "Phytozome (JGI)":
-        info += "**Access Points:**\n"
-        info += "- **Website:** [https://phytozome-next.jgi.doe.gov/](https://phytozome-next.jgi.doe.gov/)\n"
-        info += "- **JGI Data Portal:** For browsing and downloading JGI-sequenced plant genomes.\n"
-        if species:
-             info += f"  - *Typically, you select species from their browser, then find download sections for FASTA, GFF3, etc.*\n"
-    elif db_name == "The Arabidopsis Information Resource (TAIR)": # Example for new DB
-        info += "**Access Points:**\n"
-        info += "- **Website:** [https://www.arabidopsis.org/](https://www.arabidopsis.org/)\n"
-        info += "- **Search:** Use the search bar for genes, loci, keywords.\n"
-        info += "- **Bulk Data:** Often found in FTP or download sections.\n"
-        if search_term:
-            info += f"  - *Example Search for '{search_term}':* [https://www.arabidopsis.org/servlets/Search?type=general&search_action=detail&method=1&name={search_term.replace(' ', '+')}&sub_type=gene](https://www.arabidopsis.org/servlets/Search?type=general&search_action=detail&method=1&name={search_term.replace(' ', '+')}&sub_type=gene)\n"
+# --- 2. Gene Explorer Function (Solely for Live NCBI Data) ---
+def display_fetched_ncbi_gene_in_explorer():
+    global app_state 
+    if app_state.get("last_fetched_ncbi_gene_details"):
+        gene_data = app_state["last_fetched_ncbi_gene_details"]
+        if not gene_data:
+             return gr.Markdown("Error: Last fetched NCBI gene details are empty. Please re-fetch from NCBI tab."), gr.Markdown("")
     else:
-        info += "Database not recognized or information not yet available for this configured option."
+        return gr.Markdown("No NCBI Gene data has been successfully fetched yet. Use the 'NCBI Gene/Protein Search' tab to fetch a **Gene record**."), gr.Markdown("")
+    info_md = f"### Gene Information (Source: Live NCBI Data)\n"
+    info_md += f"**Input ID/Symbol for Fetch:** {gene_data.get('input_id', 'N/A')}\n" # Display original input
+    info_md += f"**Resolved NCBI GeneID:** {gene_data.get('ncbi_gene_id', 'N/A')}\n"
+    info_md += f"**Official Symbol:** {gene_data.get('name', 'N/A')}\n"
+    info_md += f"**Official Full Name:** {gene_data.get('full_name_from_summary', gene_data.get('description', 'N/A'))}\n" # Use full name, fallback to desc
+    info_md += f"**Summary/Description:** {gene_data.get('description', 'N/A')}\n"
 
-    # --- Create and save the sample FASTA file ---
-    fasta_content = ""
-    if MOCK_GENE_DATA:
-        for gene_id, data in MOCK_GENE_DATA.items():
-            fasta_content += f">{gene_id} {data.get('name', 'Unknown Name')}\n" # Use .get for safety
-            # Dummy sequence
-            fasta_content += "ATGCGTAGCATCGATCGATCGATCGTAGCATGCTAGCATCGATCGATCGTAGCTAGCATCG\n"
-            fasta_content += "GCTAGCATCGATCGATCGTAGCTAGCATCGATCGATCGTAGCTAGCATCGATCGATCGTAG\n"
+    if 'organism' in gene_data:
+        info_md += f"**Organism:** {gene_data.get('organism', 'N/A')}\n"
+    
+    ncbi_gene_id_val = gene_data.get('ncbi_gene_id', None) 
+    if ncbi_gene_id_val and ncbi_gene_id_val != "UNKNOWN": 
+        info_md += f"**NCBI Gene Page Link:** [{ncbi_gene_id_val}](https://www.ncbi.nlm.nih.gov/gene/{ncbi_gene_id_val})\n"
+    
+    go_terms = gene_data.get('go_terms', [])
+    if go_terms:
+        info_md += "**Gene Ontology (GO) Terms:**\n"
+        for go_term_entry in go_terms:
+            if isinstance(go_term_entry, str) and ';' in go_term_entry:
+                term_id, term_desc_cat = go_term_entry.split(';', 1)
+                term_id = term_id.strip()
+                term_desc_cat = term_desc_cat.strip()
+                info_md += f"- [{term_id}](http://amigo.geneontology.org/amigo/term/{term_id}) {term_desc_cat}\n"
+            elif isinstance(go_term_entry, str): 
+                info_md += f"- [{go_term_entry}](http://amigo.geneontology.org/amigo/term/{go_term_entry})\n"
     else:
-        fasta_content = ">NO_MOCK_DATA_AVAILABLE\nNNNNNNNNNN\n"
-    
-    safe_db_name = db_name.split(' ')[0].lower().replace('(', '').replace(')', '')
-    timestamp = int(time.time())
-    sample_filename = f"{safe_db_name}_sample_genes_{timestamp}.fasta"
-    sample_file_path = os.path.join(DATA_DIR, sample_filename)
-    
-    file_for_download = None
+        info_md += "**Gene Ontology (GO) Terms:** Not available or not fetched.\n"
+    expression_info_md = "*Expression plot not applicable for NCBI Gene records via this tool.*"
+    return gr.Markdown(info_md), gr.Markdown(expression_info_md)
+
+# --- 3. NCBI Data Retrieval Functions ---
+def fetch_go_terms_for_gene(numeric_gene_id_str):
+    go_terms_list = []
+    if not numeric_gene_id_str or not numeric_gene_id_str.isdigit():
+        print(f"fetch_go_terms_for_gene: Invalid or non-numeric Gene ID '{numeric_gene_id_str}'. Cannot fetch GO terms.")
+        return go_terms_list          
     try:
-        with open(sample_file_path, "w") as f:
-            f.write(fasta_content)
-        info += f"\n**Mock data file generated:** `{sample_filename}` has been saved to the `{DATA_DIR}` directory and is available for download."
-        file_for_download = sample_file_path
+        print(f"Fetching GO terms for numeric Gene ID: {numeric_gene_id_str}")
+        handle = Entrez.esummary(db="gene", id=numeric_gene_id_str, retmode="xml")
+        tree = ElementTree.parse(handle)
+        handle.close()
+        root = tree.getroot()
+        for doc_summary in root.findall(".//DocumentSummary"): # Should be only one for a single ID
+            for go_info in doc_summary.findall(".//GeneOntologyInfo/GeneOntology"):
+                go_id_elem = go_info.find("GOTermID")
+                go_term_name_elem = go_info.find("GOTermName")
+                go_category_elem = go_info.find("GOCategory")
+                go_id = go_id_elem.text if go_id_elem is not None else None
+                go_term_name = go_term_name_elem.text if go_term_name_elem is not None else None
+                go_category = go_category_elem.text if go_category_elem is not None else None
+                if go_id and go_term_name and go_category:
+                    go_terms_list.append(f"{go_id}; {go_term_name} ({go_category})")
     except Exception as e:
-        info += f"\n**Error saving file:** Could not write to `{sample_file_path}`. Error: {e}"
+        print(f"Error fetching/parsing GO terms for Gene ID {numeric_gene_id_str}: {e}")
+    return go_terms_list
+
+def fetch_ncbi_data_by_id(id_to_use_for_fetch, db_type, original_input_id=None):
+    """
+    Fetches NCBI data using a NUMERIC GeneID (for Gene type) or Accession (for Protein type).
+    id_to_use_for_fetch: The ID ESearch resolved to (numeric for Gene) or direct input.
+    original_input_id: The very first ID the user typed (symbol, LOC, numeric etc.) for context.
+    """
+    global app_state 
+    app_state["last_fetched_ncbi_gene_details"] = None 
+    if not id_to_use_for_fetch:
+        return "Error: No ID provided to fetch_ncbi_data_by_id.", "", None 
     
-    data_dir_listing_md = list_data_files_md()
+    if original_input_id is None: # If not passed, use the fetch ID as original
+        original_input_id = id_to_use_for_fetch
+
+    info_md_content = ""
+    fasta_str_content = ""
+    download_file_path = None
+    
+    try:
+        if db_type == "Gene":
+            # This function now primarily expects id_to_use_for_fetch to be the NUMERIC GeneID
+            if not id_to_use_for_fetch.isdigit():
+                msg = f"Internal Error: fetch_ncbi_data_by_id for Gene type expects a numeric ID, but received '{id_to_use_for_fetch}'. ESearch resolution might be needed."
+                print(msg)
+                return f"**{msg}**", "", None
+
+            numeric_gene_id = id_to_use_for_fetch
+            print(f"Fetching details for NUMERIC Gene ID: {numeric_gene_id}")
+
+            # 1. Fetch Gene Summary using ESummary
+            official_symbol_from_summary = original_input_id # Default to original input if symbol not found in summary
+            full_name_from_summary = "N/A"
+            description_from_summary = "N/A"
+            organism_from_summary = "N/A"
+            
+            print(f"Fetching ESummary for Gene ID: {numeric_gene_id}")
+            handle_summary = Entrez.esummary(db="gene", id=numeric_gene_id, retmode="xml")
+            summary_tree = ElementTree.parse(handle_summary)
+            handle_summary.close()
+            summary_root = summary_tree.getroot()
+            doc_sum = summary_root.find(".//DocumentSummary") # Should only be one for a single ID
+            if doc_sum is not None:
+                name_elem = doc_sum.find("Name") 
+                desc_elem = doc_sum.find("Summary") 
+                if desc_elem is None: desc_elem = doc_sum.find("Description")
+                org_elem = doc_sum.find("Organism/ScientificName")
+                off_sym_elem = doc_sum.find("NomenclatureSymbol")
+
+                if name_elem is not None and name_elem.text: full_name_from_summary = name_elem.text
+                if desc_elem is not None and desc_elem.text: description_from_summary = desc_elem.text
+                if org_elem is not None and org_elem.text: organism_from_summary = org_elem.text
+                if off_sym_elem is not None and off_sym_elem.text: official_symbol_from_summary = off_sym_elem.text
+            else:
+                print(f"Could not find DocumentSummary in ESummary XML for {numeric_gene_id}")
+
+            # 2. Fetch Sequence using EFetch with rettype="fasta_cds_na" or "fasta" (genomic)
+            sequence_length = 0
+            print(f"Fetching FASTA sequence for Gene ID: {numeric_gene_id}")
+            try:
+                handle_fasta_seq = Entrez.efetch(db="gene", id=numeric_gene_id, rettype="fasta_cds_na", retmode="text")
+                fasta_records = list(SeqIO.parse(handle_fasta_seq, "fasta"))
+                handle_fasta_seq.close()
+                if fasta_records:
+                    seq_record = fasta_records[0] 
+                    fasta_str_content = f">{seq_record.id} {seq_record.description}\n{str(seq_record.seq)}\n"
+                    sequence_length = len(seq_record.seq)
+                    print(f"Fetched CDS FASTA: {seq_record.id}")
+                else: 
+                    print(f"No CDS FASTA found for {numeric_gene_id}. Trying genomic FASTA.")
+                    handle_fasta_genomic = Entrez.efetch(db="gene", id=numeric_gene_id, rettype="fasta", retmode="text")
+                    fasta_records_genomic = list(SeqIO.parse(handle_fasta_genomic, "fasta"))
+                    handle_fasta_genomic.close()
+                    if fasta_records_genomic:
+                        seq_record = fasta_records_genomic[0]
+                        fasta_str_content = f">{seq_record.id} {seq_record.description}\n{str(seq_record.seq)}\n"
+                        sequence_length = len(seq_record.seq)
+                        print(f"Fetched genomic FASTA: {seq_record.id}")
+                    else:
+                        print(f"No FASTA sequence (CDS or genomic) found for Gene ID {numeric_gene_id}.")
+            except Exception as e_fasta:
+                print(f"Error during FASTA sequence retrieval for {numeric_gene_id}: {e_fasta}")
+                # fasta_str_content remains ""
+
+            # 3. Fetch GO Terms
+            go_terms = fetch_go_terms_for_gene(numeric_gene_id)
+            
+            fetched_details_for_explorer = {
+                "input_id": original_input_id, # Store the original user input for context
+                "id": numeric_gene_id, 
+                "name": official_symbol_from_summary, 
+                "full_name_from_summary": full_name_from_summary,
+                "description": description_from_summary, 
+                "organism": organism_from_summary,
+                "ncbi_gene_id": numeric_gene_id, 
+                "go_terms": go_terms,
+                "sequence_length": sequence_length
+            }
+            app_state["last_fetched_ncbi_gene_details"] = fetched_details_for_explorer
+            
+            info_md_content += f"### NCBI Gene: {official_symbol_from_summary} (GeneID: {numeric_gene_id})\n"
+            info_md_content += f"*(Successfully resolved from input: '{original_input_id}')*\n" if original_input_id != numeric_gene_id else ""
+            info_md_content += f"**Official Full Name:** {full_name_from_summary}\n"
+            info_md_content += f"**Summary/Description:** {description_from_summary}\n"
+            # ... (rest of info_md_content)
+            info_md_content += f"**Organism:** {organism_from_summary}\n"
+            info_md_content += f"**Sequence Length:** {sequence_length} bp (first CDS/genomic record)\n"
+            if go_terms:
+                 info_md_content += f"**Fetched GO Terms:** {len(go_terms)} (see Gene Explorer tab for list).\n"
+            else:
+                 info_md_content += f"**GO Terms:** None found or error during fetch.\n"
+            info_md_content += f"**View on NCBI:** [https://www.ncbi.nlm.nih.gov/gene/{numeric_gene_id}](https://www.ncbi.nlm.nih.gov/gene/{numeric_gene_id})\n"
+            filename_id_part = official_symbol_from_summary if official_symbol_from_summary != "N/A" else numeric_gene_id
+
+        elif db_type == "Protein": 
+            # id_to_use_for_fetch is the protein accession here
+            handle_fasta_prot = Entrez.efetch(db="protein", id=id_to_use_for_fetch, rettype="fasta", retmode="text")
+            record_prot = SeqIO.read(handle_fasta_prot, "fasta")
+            handle_fasta_prot.close()
+            app_state["last_fetched_ncbi_gene_details"] = None 
+            info_md_content += f"### NCBI Protein: {record_prot.id}\n"
+            info_md_content += f"**Description:** {record_prot.description}\n"
+            info_md_content += f"**Sequence Length:** {len(record_prot.seq)} aa\n"
+            info_md_content += f"**View on NCBI:** [https://www.ncbi.nlm.nih.gov/protein/{id_to_use_for_fetch}](https://www.ncbi.nlm.nih.gov/protein/{id_to_use_for_fetch})\n"
+            fasta_str_content = f">{record_prot.id} {record_prot.description}\n{str(record_prot.seq)}\n"
+            filename_id_part = record_prot.id.split('|')[-2] if '|' in record_prot.id and len(record_prot.id.split('|')) > 2 else record_prot.id
+            info_md_content += "\n*Note: Protein data loaded. The 'Gene Explorer' tab is for 'Gene' record details.*"
+        else:
+            return f"Error: Invalid database type '{db_type}'.", "", None
+
+        if fasta_str_content:
+            timestamp = int(time.time())
+            safe_filename_id = "".join(c for c in str(filename_id_part) if c.isalnum() or c in ('_', '-')).strip() or "record"
+            fasta_filename = f"ncbi_{db_type.lower()}_{safe_filename_id}_{timestamp}.fasta"
+            temp_file_path = os.path.join(DATA_DIR, fasta_filename)
+            with open(temp_file_path, "w") as f:
+                f.write(fasta_str_content)
+            download_file_path = temp_file_path
+            info_md_content += f"\n**File saved:** `{fasta_filename}` in `{DATA_DIR}` and available for download."
+        else:
+            info_md_content += "\n*Note: No sequence data was retrieved for this record or an error occurred during sequence fetch.*"
+
+        if db_type == "Gene" and app_state["last_fetched_ncbi_gene_details"]:
+             info_md_content += "\n**Data ready to load in 'Gene Explorer' tab.**"
         
-    return gr.Markdown(info), file_for_download, gr.Markdown(data_dir_listing_md)
+        return info_md_content, fasta_str_content, download_file_path
 
-# --- 2. Gene-Trait Explorer Functions ---
-def get_gene_info(gene_id):
-    if not MOCK_GENE_DATA:
-        return "Mock gene data not loaded. Cannot retrieve gene info.", None
-    if not gene_id or gene_id not in MOCK_GENE_DATA:
-        return "Please select a valid gene.", None
+    except Entrez.HTTPError as http_err: 
+        error_code = http_err.code
+        error_reason = str(http_err) # http_err itself can be printed for full details
+        error_msg_detail = f"Error fetching NCBI record '{id_to_use_for_fetch}' ({db_type}): HTTP Error {error_code} ({error_reason})."
+        if error_code == 400: # Bad Request
+             error_msg_detail += " This often means the identifier is ambiguous, not found for direct EFetch/ESummary, or there's an issue with the request parameters."
+        print(f"Detailed HTTP error in fetch_ncbi_data_by_id for '{id_to_use_for_fetch}': {error_msg_detail}")
+        app_state["last_fetched_ncbi_gene_details"] = None 
+        return f"**{error_msg_detail}**\n\n*Please verify the ID and try again. If the problem persists, NCBI services might be temporarily unavailable or the ID is not directly retrievable with EFetch/ESummary.*", "", None
+    except Exception as e: 
+        error_msg_detail = f"Unexpected error processing NCBI record '{id_to_use_for_fetch}' ({db_type}): {str(e)}"
+        print(f"Detailed error in fetch_ncbi_data_by_id for '{id_to_use_for_fetch}': {error_msg_detail}") 
+        app_state["last_fetched_ncbi_gene_details"] = None 
+        return f"**{error_msg_detail}**", "", None
 
-    data = MOCK_GENE_DATA[gene_id]
-    info_md = f"### Gene: {gene_id} ({data.get('name', 'N/A')})\n"
-    info_md += f"**Description:** {data.get('description', 'N/A')}\n"
-    info_md += f"**Associated Traits:** {', '.join(data.get('traits', []))}\n"
-    info_md += f"**NCBI Gene ID:** [{data.get('ncbi_gene_id', 'N/A')}](https://www.ncbi.nlm.nih.gov/gene/{data.get('ncbi_gene_id', '')})\n"
-    info_md += f"**EnsemblPlants ID:** [{data.get('ensembl_plants_id', 'N/A')}](https://plants.ensembl.org/Arabidopsis_thaliana/Gene/Summary?g={data.get('ensembl_plants_id', '')}) (Assuming Arabidopsis for link)\n"
-    info_md += "**Gene Ontology Terms:**\n"
-    for go_term in data.get('go_terms', []):
-        info_md += f"- [{go_term}](http://amigo.geneontology.org/amigo/term/{go_term})\n"
 
-    plot_output = None
-    if data.get('expression_levels'):
-        tissues = list(data['expression_levels'].keys())
-        levels = list(data['expression_levels'].values())
+def perform_ncbi_search(selected_species, keyword_identifier, db_type):
+    global app_state
+    app_state["last_fetched_ncbi_gene_details"] = None 
+    
+    if not Entrez.email or Entrez.email == "your.email@example.com":
+        error_md = "CRITICAL: Entrez email not configured in YAML. NCBI access may fail."
+        return gr.Markdown(""), gr.Textbox(value="", visible=False), gr.File(value=None, visible=False), gr.Markdown(error_md), gr.Markdown(list_data_files_md())
+    if not keyword_identifier:
+        error_md = "Please enter a search term/ID."
+        return gr.Markdown(""), gr.Textbox(value="", visible=False), gr.File(value=None, visible=False), gr.Markdown(error_md), gr.Markdown(list_data_files_md())
+
+    original_input_id = keyword_identifier.strip() # Store the original input for context
+    info_str_md_content = ""
+    fasta_str_content = ""
+    download_file_obj = None 
+    error_md_content = ""
+    
+    is_numeric_gene_id = db_type == "Gene" and original_input_id.isdigit()
+    is_loc_tag = db_type == "Gene" and original_input_id.upper().startswith("LOC") and original_input_id[3:].isdigit()
+    is_protein_accession = db_type == "Protein" and \
+                           (original_input_id.startswith(("NP_", "XP_", "WP_", "YP_", "AP_")) or \
+                            (original_input_id.count('.') == 1 and len(original_input_id) > 5 and original_input_id.replace('.', '').isalnum()) or \
+                            (len(original_input_id) >= 6 and original_input_id.isalnum() and not original_input_id.isdigit() and original_input_id.count('_') == 0) )
+    is_potential_gene_symbol = db_type == "Gene" and not is_numeric_gene_id and not is_loc_tag and \
+                               original_input_id.isalnum() and not (' ' in original_input_id or ',' in original_input_id or ';' in original_input_id)
+
+    if is_numeric_gene_id or is_loc_tag or is_protein_accession:
+        # For LOC tags or direct numeric GeneIDs, or protein accessions, pass them directly to fetch_ncbi_data_by_id
+        # fetch_ncbi_data_by_id will handle them (expecting numeric for Gene or accession for Protein)
+        id_for_fetch = original_input_id
+        if is_loc_tag and not id_for_fetch.isdigit(): # For LOC tag, fetch_ncbi_data_by_id expects the full LOCxxxx string
+             pass # No change needed, fetch_ncbi_data_by_id handles LOC tags
+        elif is_numeric_gene_id:
+             pass # Already numeric
         
-        fig, ax = plt.subplots()
-        ax.bar(tissues, levels, color=['skyblue', 'lightgreen', 'lightcoral'])
-        ax.set_ylabel('Mock Expression Level')
-        ax.set_title(f'Mock Expression for {gene_id}')
-        plt.xticks(rotation=45, ha="right")
-        plt.tight_layout()
-        plot_output = fig
+        print(f"Attempting direct fetch for ID: {id_for_fetch}, DB: {db_type}")
+        info_str_md_content, fasta_str_content, download_file_path = fetch_ncbi_data_by_id(id_for_fetch, db_type, original_input_id=original_input_id)
+        if download_file_path:
+             download_file_obj = download_file_path 
+        if not fasta_str_content and not download_file_path and ("Error:" in info_str_md_content or "**Error" in info_str_md_content):
+            error_md_content = info_str_md_content 
+            info_str_md_content = "" 
+    
+    elif is_potential_gene_symbol:
+        print(f"Input '{original_input_id}' identified as potential gene symbol. Using ESearch with species context '{selected_species}'.")
+        search_term_for_esearch = f"{original_input_id}[Gene Name]" # Search by Gene Name field for symbols
+        if selected_species and selected_species != "All Plant Species":
+            search_term_for_esearch += f" AND \"{selected_species}\"[Organism]" # Enclose species in quotes for ESearch
         
-    return gr.Markdown(info_md), plot_output
+        try:
+            print(f"ESearch term: {search_term_for_esearch}")
+            handle_esearch = Entrez.esearch(db="gene", term=search_term_for_esearch, retmax="5", sort="relevance")
+            results = Entrez.read(handle_esearch)
+            handle_esearch.close()
+            id_list = results["IdList"]
 
-def get_trait_info(trait_name):
-    if not MOCK_TRAIT_TO_GENES:
-         return "Trait data not initialized (likely due to missing mock gene data).", None
-    if not trait_name or trait_name not in MOCK_TRAIT_TO_GENES:
-        return "Please select a valid trait.", None
+            if len(id_list) == 1:
+                numeric_gene_id_from_esearch = id_list[0]
+                info_str_md_content = f"Found unique Gene ID '{numeric_gene_id_from_esearch}' for symbol '{original_input_id}' (context: {selected_species}). Fetching details...\n\n"
+                details_md, fasta_str_content, download_file_path = fetch_ncbi_data_by_id(numeric_gene_id_from_esearch, "Gene", original_input_id=original_input_id)
+                info_str_md_content += details_md # Append fetched details to the ESearch result message
+                if download_file_path:
+                    download_file_obj = download_file_path
+                if not fasta_str_content and not download_file_path and ("Error:" in info_str_md_content or "**Error" in info_str_md_content):
+                     # Error from fetching the resolved ID, info_str_md_content already contains the error from fetch_ncbi_data_by_id
+                     # We might want to make the initial part of info_str_md_content conditional on success
+                     if "Error:" in details_md or "**Error" in details_md: # Check if fetching the resolved ID failed
+                          info_str_md_content = f"Found unique Gene ID '{numeric_gene_id_from_esearch}' for symbol '{original_input_id}' but an error occurred fetching its details. {details_md}"
+                          error_md_content = "" # Error is already in info_str_md_content
+                     else: # Success
+                          pass # info_str_md_content is already good.
 
-    associated_genes = MOCK_TRAIT_TO_GENES[trait_name]
-    info_md = f"### Trait: {trait_name}\n"
-    info_md += f"**Genes associated with this trait (mock data):**\n"
-    gene_list_for_table = []
-    for gene_id in associated_genes:
-        gene_data = MOCK_GENE_DATA.get(gene_id, {}) # Use .get for safety
-        info_md += f"- {gene_id} ({gene_data.get('name', 'N/A')})\n"
-        gene_list_for_table.append({
-            "Gene ID": gene_id,
-            "Gene Name": gene_data.get('name', 'N/A'),
-            "Description": gene_data.get('description', 'N/A')
-        })
-    df_genes = pd.DataFrame(gene_list_for_table)
+            elif len(id_list) > 1:
+                summaries_md = ""
+                # Optionally fetch summaries for ambiguous results
+                # try:
+                #     handle_sum_ambiguous = Entrez.esummary(db="gene", id=",".join(id_list[:3]), retmode="xml") # Summaries for top 3
+                #     sum_tree_amb = ElementTree.parse(handle_sum_ambiguous)
+                #     handle_sum_ambiguous.close()
+                #     for doc_sum_amb in sum_tree_amb.findall(".//DocumentSummary"):
+                #         sum_name = doc_sum_amb.find("Name").text if doc_sum_amb.find("Name") is not None else "N/A"
+                #         sum_desc = doc_sum_amb.find("Summary").text if doc_sum_amb.find("Summary") is not None else "N/A"
+                #         sum_id = doc_sum_amb.get("uid")
+                #         summaries_md += f"- **ID:** {sum_id}, **Name:** {sum_name}, **Summary:** {sum_desc[:100]}...\n"
+                # except Exception as e_sum_amb:
+                #     summaries_md = f"\nCould not fetch summaries for ambiguous results: {e_sum_amb}"
 
-    return gr.Markdown(info_md), df_genes
+
+                info_str_md_content = (f"Symbol '{original_input_id}' (context: {selected_species}) is ambiguous and matches multiple Gene IDs: **{', '.join(id_list)}**. "
+                                       f"Please try one of these numeric IDs directly for a specific record.{summaries_md}")
+                fasta_str_content = ""
+                download_file_obj = None
+            else: # len(id_list) == 0
+                info_str_md_content = f"No direct NCBI Gene ID found for symbol '{original_input_id}' with species context '{selected_species}' via ESearch. It might be a broader keyword or the symbol/species combination is not found."
+                # Fall through to generate keyword link
+                fasta_str_content = ""
+                download_file_obj = None
+                # Generate keyword link because ESearch failed to find specific symbol
+                query_parts_kw = [f"({original_input_id}[All Fields])"] 
+                if selected_species and selected_species != "All Plant Species":
+                    query_parts_kw.append(f"\"{selected_species}\"[Organism]")
+                full_query_kw = " AND ".join(query_parts_kw)
+                search_url_db_part_kw = "gene" 
+                encoded_query_kw = urllib.parse.quote_plus(full_query_kw)
+                search_url_kw = f"https://www.ncbi.nlm.nih.gov/{search_url_db_part_kw}/?term={encoded_query_kw}"
+                info_str_md_content += (f"\n\nYou can try a broader search on NCBI: "
+                                        f"**[Search NCBI for '{original_input_id}' in '{selected_species}']({search_url_kw})**")
 
 
-# --- 3. Gradio Interface ---
+        except Exception as e_esearch:
+            error_md_content = f"Error during ESearch for symbol '{original_input_id}': {str(e_esearch)}"
+            print(error_md_content)
+            # Also provide a general keyword search link as a fallback
+            query_parts_kw_fail = [f"({original_input_id}[All Fields])"]
+            if selected_species and selected_species != "All Plant Species":
+                query_parts_kw_fail.append(f"\"{selected_species}\"[Organism]")
+            full_query_kw_fail = " AND ".join(query_parts_kw_fail)
+            search_url_db_part_kw_fail = "gene"
+            encoded_query_kw_fail = urllib.parse.quote_plus(full_query_kw_fail)
+            search_url_kw_fail = f"https://www.ncbi.nlm.nih.gov/{search_url_db_part_kw_fail}/?term={encoded_query_kw_fail}"
+            info_str_md_content = error_md_content + (f"\n\nAs ESearch failed, you can try a broader search on NCBI: "
+                                        f"**[Search NCBI for '{original_input_id}' in '{selected_species}']({search_url_kw_fail})**")
+            fasta_str_content = ""
+            download_file_obj = None
+    else: 
+        # General keyword search if not a direct ID and not a potential symbol
+        print(f"Treating input '{original_input_id}' as general keyword for DB: {db_type}, Species: {selected_species}")
+        query_parts_gen = [f"({original_input_id}[All Fields])"] 
+        if selected_species and selected_species != "All Plant Species":
+            query_parts_gen.append(f"\"{selected_species}\"[Organism]")
+        
+        full_query_gen = " AND ".join(query_parts_gen)
+        search_url_db_part_gen = "gene" if db_type == "Gene" else "protein"
+        encoded_query_gen = urllib.parse.quote_plus(full_query_gen)
+        search_url_gen = f"https://www.ncbi.nlm.nih.gov/{search_url_db_part_gen}/?term={encoded_query_gen}"
+        info_str_md_content = (f"**Keyword-based Search Information:**\n\n"
+                               f"Input '{original_input_id}' was treated as a general keyword. "
+                               f"A link to the NCBI website is provided below.\n\n"
+                               f"- **Database:** {db_type}\n"
+                               f"- **Species Context:** {selected_species if selected_species and selected_species != 'All Plant Species' else 'Any/Not specified'}\n"
+                               f"- **Search Term:** {original_input_id}\n"
+                               f"- **Constructed NCBI Query String:** `{full_query_gen}`\n\n"
+                               f"**➡️ [Click here to perform this search directly on the NCBI website]({search_url_gen})**")
+        fasta_str_content = "" 
+        download_file_obj = None 
+            
+    current_file_list_md = list_data_files_md()
+    show_sequence_and_download = bool(fasta_str_content)
+
+    # Consolidate error display
+    if error_md_content and not info_str_md_content: # If only error, show it as primary info
+        info_str_md_content = error_md_content
+        error_md_content = "" # Clear separate error display if main info is error
+    elif error_md_content: # Append to info if both exist
+        info_str_md_content += f"\n\n**Additional Errors/Status:**\n{error_md_content}"
+
+
+    return gr.Markdown(info_str_md_content), \
+           gr.Textbox(value=fasta_str_content, label="Fetched Sequence (FASTA Format)", lines=10, interactive=False, visible=show_sequence_and_download), \
+           gr.File(value=download_file_obj, label="Download Fetched FASTA File", visible=show_sequence_and_download), \
+           gr.Markdown(""), \
+           gr.Markdown(current_file_list_md) # Error display is now part of main info if needed
+
+
+# --- 4. Gradio Interface ---
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown(config["app_title"]) # Use title from config
-    gr.Markdown(config["app_description"]) # Use description from config
+    gr.Markdown(f"# {config['app_title']}")
+    gr.Markdown(config["app_description"])
+    shared_data_dir_contents_output = gr.Markdown(value=list_data_files_md(), label=f"Files in ./{DATA_DIR}")
 
-    with gr.Tab("Data Acquisition Guide"):
-        gr.Markdown("## Select and 'Download' Open Genetic Repositories")
-        gr.Markdown(
-            "Choose a database and provide optional species/search terms to get information and links. "
-            f"A sample FASTA file based on mock data will be **saved to the local `./{DATA_DIR}` directory** and offered for browser download."
-        )
+    # Tab for "Data Acquisition Guide" is REMOVED
+
+    with gr.Tab("NCBI Gene/Protein Search (Live Data)"):
+        gr.Markdown("## Fetch Gene or Protein Data Directly from NCBI")
+        gr.Markdown("Enter an NCBI Gene ID (e.g., `816394`), Locus Tag (e.g. `LOC542363`), Gene Symbol (e.g. `PHYB`), or Protein Accession (e.g., `NP_171631.1`). If a **Gene ID/Symbol/Locus Tag** is provided and resolved to a unique Gene record, its details will be fetched for the 'Gene Explorer' tab. For broader keywords or ambiguous symbols, a search link to NCBI may be generated.")
+        if not Entrez.email or Entrez.email == "your.email@example.com":
+             gr.Markdown("<p style='color:red;font-weight:bold;'>WARNING: NCBI Entrez email is not configured! Update in `genetics_explorer_config.yaml`. NCBI lookups may fail.</p>")
         with gr.Row():
-            db_dropdown = gr.Dropdown(
-                choices=config["database_options"], # Use choices from config
-                label="Select Genetic Database",
-                value=config["default_database"] # Use default from config
+            species_dropdown_ncbi = gr.Dropdown(
+                choices=["All Plant Species"] + NCBI_PLANT_SPECIES, value="All Plant Species",
+                label="Select Plant Species (Context for Symbol/Keyword Search)",
+                info="Helps disambiguate gene symbols. Less critical for direct numeric IDs/Accessions."
             )
-        with gr.Row():
-            species_input = gr.Textbox(label="Plant Species (e.g., Arabidopsis thaliana, Oryza sativa)", placeholder="Optional")
-            search_term_input = gr.Textbox(label="Search Term (e.g., Gene ID, keyword like 'kinase')", placeholder="Optional")
-        
-        search_db_btn = gr.Button("Get Database Info & Generate Sample File", variant="primary")
-        
-        db_info_output = gr.Markdown(label="Database Information & Access Instructions")
-        download_file_output = gr.File(label="Download Generated Sample File")
-        
-        gr.Markdown("---")
-        data_dir_contents_output = gr.Markdown(value=list_data_files_md(), label=f"Files in ./{DATA_DIR}")
-        
-        search_db_btn.click(
-            fn=get_database_info,
-            inputs=[db_dropdown, species_input, search_term_input],
-            outputs=[db_info_output, download_file_output, data_dir_contents_output]
+            ncbi_db_type_dropdown = gr.Dropdown(choices=["Gene", "Protein"], value="Gene", 
+                                                label="Select NCBI Database Type (Choose 'Gene' to populate Gene Explorer)")
+        keyword_identifier_input_ncbi = gr.Textbox(
+            label="Gene Symbol, NCBI Gene ID, Locus Tag, Protein Acc, or Keyword", 
+            placeholder="e.g., PHYB, 816394, LOC542363, NP_171631.1"
         )
-
-    with gr.Tab("Gene-Trait Explorer (Mock Data)"):
-        gr.Markdown("## Evaluate How Genes Affect Plant Traits (Using Mock Data)")
+        fetch_ncbi_btn = gr.Button("Search/Fetch from NCBI", variant="primary")
+        ncbi_info_output = gr.Markdown(label="Search Results / Fetched Information") # Main output for info and errors
+        ncbi_sequence_output = gr.Textbox(label="Fetched Sequence (FASTA Format)", lines=10, interactive=False, visible=False)
+        ncbi_download_file_output = gr.File(label="Download Fetched FASTA File", visible=False)
+        # ncbi_error_output = gr.Markdown(label="Status/Errors") # Errors now part of ncbi_info_output
+        gr.Markdown("---")
+        gr.Markdown(render=shared_data_dir_contents_output)
+        fetch_ncbi_btn.click(
+            fn=perform_ncbi_search,
+            inputs=[species_dropdown_ncbi, keyword_identifier_input_ncbi, ncbi_db_type_dropdown],
+            outputs=[ncbi_info_output, ncbi_sequence_output, ncbi_download_file_output, gr.Markdown(""), shared_data_dir_contents_output] # Pass empty md to removed error output
+        )
         
-        gene_ids_list = list(MOCK_GENE_DATA.keys()) if MOCK_GENE_DATA else []
-        trait_list = list(MOCK_TRAIT_TO_GENES.keys()) if MOCK_TRAIT_TO_GENES else []
-
+    with gr.Tab("Gene Explorer (Live NCBI Data)"):
+        gr.Markdown("## Explore Details of Fetched NCBI Gene Record")
+        gr.Markdown("After successfully fetching a **Gene record** from the 'NCBI Gene/Protein Search' tab (often by providing a numeric GeneID, or a symbol that resolves uniquely), click the button below to load and display its details, including GO terms.")
         with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown("### Explore by Gene")
-                gene_dropdown = gr.Dropdown(choices=gene_ids_list, label="Select Gene ID", 
-                                            info="Populated from mock_gene_data in config.")
-                gene_info_btn = gr.Button("Get Gene Info", variant="secondary")
-            with gr.Column(scale=1):
-                gr.Markdown("### Explore by Trait")
-                trait_dropdown = gr.Dropdown(choices=trait_list, label="Select Plant Trait",
-                                             info="Populated from mock_gene_data in config.")
-                trait_info_btn = gr.Button("Get Trait Info", variant="secondary")
-
+            load_fetched_gene_btn = gr.Button("Load Last Fetched NCBI Gene Details", variant="primary", scale=1)
         with gr.Row():
             with gr.Column(scale=2):
-                gene_details_output = gr.Markdown(label="Gene Details")
-                trait_details_output = gr.Markdown(label="Trait Details")
-                trait_genes_table_output = gr.DataFrame(label="Genes for Selected Trait")
+                gene_details_output_explorer = gr.Markdown(label="Fetched Gene Details") 
             with gr.Column(scale=1):
-                expression_plot_output = gr.Plot(label="Mock Gene Expression Plot")
-        
-        if gene_ids_list: # Only attach click handler if there are genes
-            gene_info_btn.click(
-                fn=get_gene_info,
-                inputs=[gene_dropdown],
-                outputs=[gene_details_output, expression_plot_output]
-            ).then(lambda: (None, None), outputs=[trait_details_output, trait_genes_table_output])
-        else:
-            gr.Markdown("*Gene selection disabled: No mock gene data found or loaded.*")
-
-
-        if trait_list: # Only attach click handler if there are traits
-            trait_info_btn.click(
-                fn=get_trait_info,
-                inputs=[trait_dropdown],
-                outputs=[trait_details_output, trait_genes_table_output]
-            ).then(lambda: (None, None), outputs=[gene_details_output, expression_plot_output])
-        else:
-             gr.Markdown("*Trait selection disabled: No mock trait data found or loaded.*")
-
+                expression_info_explorer = gr.Markdown(label="Expression Info") 
+        load_fetched_gene_btn.click(
+            fn=display_fetched_ncbi_gene_in_explorer,
+            inputs=[], 
+            outputs=[gene_details_output_explorer, expression_info_explorer] 
+        )
+        if not app_state.get("last_fetched_ncbi_gene_details"):
+            gr.Markdown("*No NCBI Gene data loaded yet. Use the 'NCBI Gene/Protein Search' tab first to fetch a 'Gene' record by its ID/Symbol.*", elem_id="initial_gene_explorer_message")
 
 if __name__ == "__main__":
-    setup_data_directory() # Ensure data directory (from config) exists on startup
-    
+    setup_data_directory()
     print(f"Application configured with DATA_DIR: '{DATA_DIR}'")
-    print(f"Mock gene data keys loaded: {list(MOCK_GENE_DATA.keys()) if MOCK_GENE_DATA else 'None'}")
+    print(f"NCBI Entrez Email set to: '{Entrez.email}' (CRITICAL: Update in config if this is the default!)")
+    print(f"Configured Plant species for NCBI search: {NCBI_PLANT_SPECIES}")
+    print("Application is now focused on live NCBI data. Mock data and Guide tab have been removed.")
     print("Open application in a browser at http://127.0.0.1:7860 (or the address shown by Gradio)")
-    demo.launch(debug=True) # debug=True is helpful for development
-    
+    demo.launch(debug=True, show_error=True) 
     print(f"Application closed. Files are stored in ./{DATA_DIR}")
     print(f"Full path to data directory: {os.path.abspath(DATA_DIR)}")
+
